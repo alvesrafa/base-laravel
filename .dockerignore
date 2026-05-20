@@ -1,0 +1,6 @@
+storage/logs/*
+storage/framework/cache/*
+tests
+.phpunit.result.cache
+.git
+.gitignore

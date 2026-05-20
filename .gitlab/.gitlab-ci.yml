@@ -1,0 +1,186 @@
+stages:
+  - quality
+  - test
+  - docker-build
+  - deploy
+
+variables:
+  COMPOSER_ALLOW_SUPERUSER: 1
+  AKS_PATH: "./.gitlab/"
+  AKS_CLUSTER_NAME: "default-cluster-name"
+  AKS_RESOURCE_GROUP: "default-resource-group"
+  ENV: "default-env"
+  AZURE_ACR_NAME: "default-acr"
+  DOCKERFILE_PATH: "./docker"
+
+# Define when pipelines should run
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && ($CI_COMMIT_BRANCH == "development" || $CI_COMMIT_BRANCH == "homolog" || $CI_COMMIT_BRANCH == "production")'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "development" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "homolog")'
+    - when: never
+
+# # Lint Job - Code Quality
+# lint:
+#   stage: quality
+#   image: php:8.4-cli-alpine
+#   tags:
+#     - docker
+#   before_script:
+#     - apk update && apk add --no-cache git curl unzip nodejs npm postgresql-dev libzip-dev oniguruma-dev icu-dev
+#     - docker-php-ext-install zip intl mbstring
+#     - curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+#   script:
+#     - composer config http-basic.composer.fluxui.dev "$FLUX_USERNAME" "$FLUX_LICENSE_KEY"
+#     - composer install -q --no-ansi --no-interaction --no-scripts --no-progress --prefer-dist
+#     - npm install
+#     - vendor/bin/pint
+#   rules:
+#     - if: '$CI_COMMIT_BRANCH == "development"'
+#     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "development"'
+
+# # Tests Job - Run PHPUnit/Pest
+# test:
+#   stage: test
+#   image: php:8.4-cli-alpine
+#   tags:
+#     - docker
+#   services:
+#     - postgres:latest
+#   variables:
+#     POSTGRES_DB: test_db
+#     POSTGRES_USER: postgres
+#     POSTGRES_PASSWORD: postgres
+#     DB_CONNECTION: pgsql
+#     DB_HOST: postgres
+#     DB_PORT: 5432
+#     DB_DATABASE: test_db
+#     DB_USERNAME: postgres
+#     DB_PASSWORD: postgres
+#   before_script:
+#     - apk update && apk add --no-cache git curl unzip nodejs npm postgresql-dev postgresql-client libzip-dev oniguruma-dev icu-dev linux-headers
+#     - docker-php-ext-install zip intl mbstring pdo pdo_pgsql
+#     - apk add --no-cache $PHPIZE_DEPS
+#     - pecl install xdebug
+#     - docker-php-ext-enable xdebug
+#     - curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+#   script:
+#     - composer config http-basic.composer.fluxui.dev "$FLUX_USERNAME" "$FLUX_LICENSE_KEY"
+#     - composer install --no-interaction --prefer-dist --optimize-autoloader
+#     - npm install
+#     - cp .env.example .env
+#     - php artisan key:generate
+#     # Wait for PostgreSQL to be ready
+#     - timeout 30s sh -c 'until pg_isready -h postgres -p 5432; do sleep 1; done'
+#     - npm run build
+#     - php artisan config:clear
+#     - ./vendor/bin/pest
+#   rules:
+#     - if: '$CI_COMMIT_BRANCH == "development"'
+#     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "development"'
+#   coverage: '/lines\s*:\s*(\d+\.\d+)%/'
+#   artifacts:
+#     reports:
+#       coverage_report:
+#         coverage_format: cobertura
+#         path: coverage/cobertura-coverage.xml
+#     paths:
+#       - coverage/
+#     expire_in: 30 days
+#     when: always
+
+# Docker Build Job - Build and push image to ACR
+docker-build:
+  stage: docker-build
+  tags:
+    - docker
+  image: docker:latest
+  services:
+    - name: docker:dind
+      alias: docker
+      entrypoint:
+        [
+          "dockerd-entrypoint.sh",
+          "--tls=false",
+          "--registry-mirror=https://mirror.gcr.io",
+        ]
+  variables:
+    DOCKER_TLS_CERTDIR: ""
+    ENV: $ENV
+    AZURE_ACR_NAME: $AZURE_ACR_NAME
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "production"'
+      variables:
+        ENV: $ENV_PRODUCTION
+        AZURE_ACR_NAME: $AZURE_ACR_PROD_NAME
+    - if: '$CI_COMMIT_BRANCH == "homolog"'
+      variables:
+        ENV: $ENV_HML
+        AZURE_ACR_NAME: $AZURE_ACR_HML_NAME
+    - when: never
+  before_script:
+    - SHORT_HASH=$(echo "$CI_COMMIT_SHA" | cut -c1-8)
+    - echo "Generated tag using commit hash = $SHORT_HASH"
+  script:
+    - echo "Creating .env file"
+    - printf '%s\n' "$ENV" > .env
+    - cat .env
+
+    - echo "Authenticating with Azure Container Registry"
+    - echo "$AZURE_CLIENT_SECRET" | docker login $AZURE_ACR_NAME.azurecr.io -u "$AZURE_CLIENT_ID" --password-stdin
+
+    - echo "Copying Dockerfile from $DOCKERFILE_PATH"
+    - cp $DOCKERFILE_PATH/Dockerfile .
+
+    - echo "Building Docker image with tag $SHORT_HASH"
+    - docker build -t "$AZURE_ACR_NAME.azurecr.io/$AZURE_ACR_REPOSITORY_NAME:$SHORT_HASH" .
+
+    - echo "Pushing Docker image to ACR"
+    - docker push "$AZURE_ACR_NAME.azurecr.io/$AZURE_ACR_REPOSITORY_NAME:$SHORT_HASH"
+
+    - IMAGE_TAG="$AZURE_ACR_NAME.azurecr.io/$AZURE_ACR_REPOSITORY_NAME:$SHORT_HASH"
+    - echo "$IMAGE_TAG" > image_info.txt
+  artifacts:
+    paths:
+      - image_info.txt
+
+# Deploy Job - Deploy to AKS
+deploy:
+  stage: deploy
+  needs:
+    - docker-build
+  tags:
+    - docker
+  image: mcr.microsoft.com/azure-cli:2.61.0
+  variables:
+    AKS_PATH: $AKS_PATH
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "production"'
+      variables:
+        AKS_PATH: "./.gitlab/production"
+        AKS_CLUSTER_NAME: "Producao"
+        AKS_RESOURCE_GROUP: "Kubernets_Producao"
+    - if: '$CI_COMMIT_BRANCH == "homolog"'
+      variables:
+        AKS_PATH: "./.gitlab/homolog"
+        AKS_CLUSTER_NAME: "Homologacao"
+        AKS_RESOURCE_GROUP: "Kubernets_Homologacao"
+    - when: never
+  script:
+    - echo "Autenticando com Azure CLI"
+    - az login --service-principal --username "$AZURE_CLIENT_ID" --password "$AZURE_CLIENT_SECRET" --tenant "$AZURE_TENANT_ID"
+
+    - echo "Conectando ao AKS"
+    - az aks get-credentials --resource-group $AKS_RESOURCE_GROUP --name $AKS_CLUSTER_NAME --overwrite-existing
+
+    - IMAGE_TAG=$(cat image_info.txt)
+
+    - sed -i -e "s#IMAGE_VERSION#$IMAGE_TAG#" $AKS_PATH/0_deployment.yaml
+
+    - echo "Fazendo deploy no Kubernetes"
+    - kubectl apply -f $AKS_PATH/0_deployment.yaml
+    - kubectl apply -f $AKS_PATH/1_service.yaml
+    - kubectl apply -f $AKS_PATH/2_hpa.yaml
+    - "[ -f $AKS_PATH/3_deployment-worker.yaml ] && sed -i -e 's#IMAGE_VERSION#'$IMAGE_TAG'#' $AKS_PATH/3_deployment-worker.yaml && kubectl apply -f $AKS_PATH/3_deployment-worker.yaml || true"
+    - "[ -f $AKS_PATH/4_deployment-worker-import.yaml ] && sed -i -e 's#IMAGE_VERSION#'$IMAGE_TAG'#' $AKS_PATH/4_deployment-worker-import.yaml && kubectl apply -f $AKS_PATH/4_deployment-worker-import.yaml || true"
+    - "[ -f $AKS_PATH/5_deployment-worker-geocoding.yaml ] && sed -i -e 's#IMAGE_VERSION#'$IMAGE_TAG'#' $AKS_PATH/5_deployment-worker-geocoding.yaml && kubectl apply -f $AKS_PATH/5_deployment-worker-geocoding.yaml || true"

@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: APP-NAME-worker
+  namespace: APP-NAMESPACE-HML
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: APP-NAME-worker
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: APP-NAME-worker
+    spec:
+      containers:
+        - name: worker
+          image: IMAGE_VERSION
+          command: ["php"]
+          args:
+            - "artisan"
+            - "queue:work"
+            - "--queue=default"
+            - "--verbose"
+            - "--tries=3"
+            - "--timeout=900"
+            - "--sleep=3"
+            - "--max-jobs=1000"
+            - "--max-time=7200"
+          resources:
+            limits:
+              cpu: 300m
+              memory: 512Mi
+            requests:
+              cpu: 200m
+              memory: 512Mi
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: node.kubernetes.io/lifecycle
+                    operator: In
+                    values:
+                      - spot
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - APP-NAME-worker
+                topologyKey: kubernetes.io/hostname
+              weight: 99
